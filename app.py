@@ -35,29 +35,36 @@ def diagnose(stderr):
         return "This video is age-restricted."
     return "Could not extract this video. It may be private, age-restricted, or blocked by the platform."
 
-_COOKIES_PATH = None
-def meta_cookies_file():
-    """Instagram/Facebook session cookies, from the IG_COOKIES env var
-    (base64 of a Netscape cookies.txt). Written once to /tmp, never to git.
-    Returns the path, or None when no cookies are configured."""
-    global _COOKIES_PATH
-    if _COOKIES_PATH is not None:
-        return _COOKIES_PATH or None
-    data = os.environ.get("IG_COOKIES", "")
+_COOKIES_CACHE = {}
+def _cookies_file(env_name, filename):
+    """Session cookies from an env var (base64 of a Netscape cookies.txt).
+    Written once to /tmp, never to git. Returns the path, or None."""
+    if env_name in _COOKIES_CACHE:
+        return _COOKIES_CACHE[env_name] or None
+    data = os.environ.get(env_name, "")
     if not data:
-        _COOKIES_PATH = False
+        _COOKIES_CACHE[env_name] = False
         return None
     try:
         raw = base64.b64decode(data)
-        path = "/tmp/ig_cookies.txt"
+        path = "/tmp/" + filename
         with open(path, "wb") as f:
             f.write(raw)
         os.chmod(path, 0o600)
-        _COOKIES_PATH = path
+        _COOKIES_CACHE[env_name] = path
     except Exception:
-        _COOKIES_PATH = False
+        _COOKIES_CACHE[env_name] = False
         return None
-    return _COOKIES_PATH
+    return _COOKIES_CACHE[env_name]
+
+def cookies_for(url):
+    """Instagram cookies for instagram.com, Facebook cookies for
+    facebook.com / fb.watch. Each site needs its own login session."""
+    if "instagram.com" in url:
+        return _cookies_file("IG_COOKIES", "ig_cookies.txt")
+    if "facebook.com" in url or "fb.watch" in url:
+        return _cookies_file("FB_COOKIES", "fb_cookies.txt")
+    return None
 
 def run_ytdlp(base_cmd, url, attempts=3, timeout=90):
     """Run yt-dlp, retrying with a different YouTube player client each time.
@@ -68,10 +75,9 @@ def run_ytdlp(base_cmd, url, attempts=3, timeout=90):
         client = YOUTUBE_CLIENTS[i % len(YOUTUBE_CLIENTS)]
         if client:
             cmd += ["--extractor-args", "youtube:player_client=%s" % client]
-        if any(d in url for d in ("instagram.com", "facebook.com", "fb.watch")):
-            c = meta_cookies_file()
-            if c:
-                cmd += ["--cookies", c]
+        c = cookies_for(url)
+        if c:
+            cmd += ["--cookies", c]
         cmd.append(url)
         try:
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)

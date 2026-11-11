@@ -16,6 +16,25 @@ FORMAT = "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"
 # back to android/ios instead of failing the whole request.
 YOUTUBE_CLIENTS = [None, "android", "ios"]
 
+def diagnose(stderr):
+    """Short human-readable reason from yt-dlp's stderr (no secrets in it)."""
+    s = (stderr or "").lower()
+    if "instagram api is not granting access" in s or "empty media response" in s:
+        return "Instagram requires login for this post — it does not serve the media to a logged-out downloader."
+    if "facebook" in s and ("login" in s or "log in" in s):
+        return "Facebook requires login for this video."
+    if "http error 429" in s or "too many requests" in s:
+        return "The platform is rate-limiting requests right now — try again later."
+    if "sign in to confirm you're not a bot" in s or "confirm you're not a bot" in s:
+        return "YouTube asked for a sign-in check — try again later."
+    if "private video" in s:
+        return "This video is private."
+    if "video unavailable" in s:
+        return "This video is unavailable or removed."
+    if "age" in s and ("confirm" in s or "restricted" in s):
+        return "This video is age-restricted."
+    return "Could not extract this video. It may be private, age-restricted, or blocked by the platform."
+
 def run_ytdlp(base_cmd, url, attempts=3, timeout=90):
     """Run yt-dlp, retrying with a different YouTube player client each time.
     Returns the first successful CompletedProcess, else the last result (or None)."""
@@ -62,7 +81,7 @@ def extract():
     if out is None:
         return jsonify({"error": "Extractor timed out, try again"}), 504
     if out.returncode != 0:
-        return jsonify({"error": "Could not extract this video. It may be private, age-restricted, or blocked by the platform."}), 502
+        return jsonify({"error": "Could not extract this video. It may be private, age-restricted, or blocked by the platform.", "detail": diagnose(out.stderr)}), 502
     try:
         info = json.loads(out.stdout)
     except Exception:
@@ -96,7 +115,7 @@ def download():
     if proc is None:
         return jsonify({"error": "Download timed out, try a shorter video"}), 504
     if proc.returncode != 0:
-        return jsonify({"error": "Could not download this video. It may be private, age-restricted, or blocked by the platform."}), 502
+        return jsonify({"error": "Could not download this video. It may be private, age-restricted, or blocked by the platform.", "detail": diagnose(proc.stderr)}), 502
     files = [os.path.join(tmpdir, f) for f in os.listdir(tmpdir) if f.startswith(os.path.basename(outtmpl))]
     if not files:
         return jsonify({"error": "Download produced no file"}), 502

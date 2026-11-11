@@ -92,7 +92,7 @@ def download():
     os.makedirs(tmpdir, exist_ok=True)
     outtmpl = os.path.join(tmpdir, str(uuid.uuid4()))
     cmd = ["yt-dlp", "-f", FORMAT, "--merge-output-format", "mp4", "-o", outtmpl + ".%(ext)s", "--no-playlist"]
-    proc = run_ytdlp(cmd, url, attempts=2, timeout=600)
+    proc = run_ytdlp(cmd, url, attempts=3, timeout=600)
     if proc is None:
         return jsonify({"error": "Download timed out, try a shorter video"}), 504
     if proc.returncode != 0:

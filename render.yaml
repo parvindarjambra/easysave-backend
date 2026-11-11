@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: easysave-backend
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health

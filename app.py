@@ -59,11 +59,15 @@ def _cookies_file(env_name, filename):
 
 def cookies_for(url):
     """Instagram cookies for instagram.com, Facebook cookies for
-    facebook.com / fb.watch. Each site needs its own login session."""
+    facebook.com / fb.watch, YouTube cookies for youtube.com / youtu.be
+    (needed when YouTube bot-checks the server IP). Each site needs
+    its own login session."""
     if "instagram.com" in url:
         return _cookies_file("IG_COOKIES", "ig_cookies.txt")
     if "facebook.com" in url or "fb.watch" in url:
         return _cookies_file("FB_COOKIES", "fb_cookies.txt")
+    if "youtube.com" in url or "youtu.be" in url:
+        return _cookies_file("YT_COOKIES", "yt_cookies.txt")
     return None
 
 def run_ytdlp(base_cmd, url, attempts=3, timeout=90):

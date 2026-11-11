@@ -5,7 +5,7 @@ Endpoints:
   POST /extract  {"url": "..."} -> {"title":..., "formats":[...], "download_url": "..."}
   GET  /download?url=... -> streams full merged HD (<=1080p) mp4 with sound via yt-dlp + ffmpeg
 """
-import json, subprocess, time
+import base64, json, os, subprocess, time
 from flask import Flask, request, jsonify, Response, stream_with_context
 
 app = Flask(__name__)
@@ -35,6 +35,30 @@ def diagnose(stderr):
         return "This video is age-restricted."
     return "Could not extract this video. It may be private, age-restricted, or blocked by the platform."
 
+_COOKIES_PATH = None
+def meta_cookies_file():
+    """Instagram/Facebook session cookies, from the IG_COOKIES env var
+    (base64 of a Netscape cookies.txt). Written once to /tmp, never to git.
+    Returns the path, or None when no cookies are configured."""
+    global _COOKIES_PATH
+    if _COOKIES_PATH is not None:
+        return _COOKIES_PATH or None
+    data = os.environ.get("IG_COOKIES", "")
+    if not data:
+        _COOKIES_PATH = False
+        return None
+    try:
+        raw = base64.b64decode(data)
+        path = "/tmp/ig_cookies.txt"
+        with open(path, "wb") as f:
+            f.write(raw)
+        os.chmod(path, 0o600)
+        _COOKIES_PATH = path
+    except Exception:
+        _COOKIES_PATH = False
+        return None
+    return _COOKIES_PATH
+
 def run_ytdlp(base_cmd, url, attempts=3, timeout=90):
     """Run yt-dlp, retrying with a different YouTube player client each time.
     Returns the first successful CompletedProcess, else the last result (or None)."""
@@ -44,6 +68,10 @@ def run_ytdlp(base_cmd, url, attempts=3, timeout=90):
         client = YOUTUBE_CLIENTS[i % len(YOUTUBE_CLIENTS)]
         if client:
             cmd += ["--extractor-args", "youtube:player_client=%s" % client]
+        if any(d in url for d in ("instagram.com", "facebook.com", "fb.watch")):
+            c = meta_cookies_file()
+            if c:
+                cmd += ["--cookies", c]
         cmd.append(url)
         try:
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)

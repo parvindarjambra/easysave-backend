@@ -206,8 +206,16 @@ def download():
         post = [{"key": "FFmpegExtractAudio", "preferredcodec": codec,
                  "preferredquality": br}]
     else:
-        h = fmt[1:]
-        ydl_fmt, ext, mime = f"bestvideo[height<={h}]+bestaudio/best[height<={h}]", "mp4", "video/mp4"
+        h = int(fmt[1:])
+        # Vertical videos (TikTok/Reels) report the LONG side as height, so a
+        # strict height<=720 filter matches nothing and yt-dlp errors with
+        # "Requested format is not available". Fall back one tier up, then
+        # to the best available — a download must never fail for that.
+        nxt = {360: 480, 720: 1080, 1080: 2160, 2160: 4320}[h]
+        ydl_fmt = (f"bestvideo[height<={h}]+bestaudio/best[height<={h}]"
+                   f"/bestvideo[height<={nxt}]+bestaudio/best[height<={nxt}]"
+                   f"/bestvideo+bestaudio/best")
+        ext, mime = "mp4", "video/mp4"
         post = [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}]
     opts = ydl_opts(url)
     opts.update({"format": ydl_fmt, "outtmpl": out, "postprocessors": post,

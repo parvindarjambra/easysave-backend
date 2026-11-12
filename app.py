@@ -114,8 +114,11 @@ def build_formats(info: dict) -> list:
             seen.add("MP3 320kbps")
             out.append({"id": "a_mp3_320", "label": "MP3 320kbps", "ext": "mp3", "kind": "audio",
                         "bitrate": 320, "filesize": f.get("filesize")})
-    # Guarantee the free cards exist even when yt-dlp lists odd formats
-    for label, fid, h in [("360p MP4", "v360", 360), ("720p MP4", "v720", 720)]:
+    # Guarantee the video cards exist even when yt-dlp lists odd formats —
+    # /download with bestvideo[height<=1080] serves 1080p anyway, so the
+    # card must not disappear just because the format list omits it.
+    for label, fid, h in [("360p MP4", "v360", 360), ("720p MP4", "v720", 720),
+                          ("1080p MP4", "v1080", 1080)]:
         if label not in seen:
             out.append({"id": fid, "label": label, "ext": "mp4", "kind": "video", "height": h, "premium": False})
     # Audio: MP3 + M4A, 128kbps free / 320kbps best quality (all free in v1)

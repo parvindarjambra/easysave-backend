@@ -75,26 +75,10 @@ def classify_error(e: Exception) -> tuple[str, str]:
         return "UNSUPPORTED", "This link is not supported."
     return "UNKNOWN", "Extraction failed. Check the link and try again."
 
-# Chrome TLS impersonation (curl_cffi): makes yt-dlp's requests look like a
-# real Chrome browser instead of Python — YouTube's bot-check weighs the TLS
-# fingerprint heavily, and datacenter IPs get login-required without it.
-# Conditional: if curl_cffi is missing, extraction still works, just without
-# impersonation. PO tokens for the web client come from the installed
-# bgutil-ytdlp-pot-provider plugin (picked up automatically by yt-dlp).
-try:
-    import curl_cffi  # noqa: F401
-    _HAS_IMPERSONATE = True
-except ImportError:
-    _HAS_IMPERSONATE = False
-
-# Retry order: android first — it returns formats for fresh videos where
-# ios/web return none; then the rest, then yt-dlp's own default sequence.
-YOUTUBE_CLIENTS = ["android", "ios", "web", "tv", "web_safari", "mweb", None]
+YOUTUBE_CLIENTS = ["ios", "android", None]  # retry with a different client each time
 
 def ydl_opts(url: str, client=None):
     opts = {"quiet": True, "noplaylist": True, "socket_timeout": 30}
-    if _HAS_IMPERSONATE:
-        opts["impersonate"] = "chrome"
     if client:
         opts["extractor_args"] = {"youtube": {"player_client": [client]}}
     cf = cookies_file_for(url)

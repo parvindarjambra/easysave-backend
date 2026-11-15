@@ -1,6 +1,6 @@
 # EasySave media engine — Flask + yt-dlp + ffmpeg
 # Only use for videos you own or have permission to download.
-import base64, ipaddress, os, re, socket, subprocess, tempfile, urllib.parse
+import base64, ipaddress, os, re, shutil, socket, subprocess, tempfile, urllib.parse
 from flask import Flask, jsonify, request, send_file, Response
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
@@ -76,6 +76,15 @@ def classify_error(e: Exception) -> tuple[str, str]:
     return "UNKNOWN", "Extraction failed. Check the link and try again."
 
 YOUTUBE_CLIENTS = ["ios", "android", None]  # retry with a different client each time
+
+# Download order is deliberately different from extract: the DEFAULT client
+# first (it returns the best formats when it works — what the site has
+# always served), then android, then ios. Mobile clients are currently hit
+# by YouTube's SABR-only experiment, which strips the 720p/1080p formats
+# and leaves only 360p progressive (itag 18) — trying them first would
+# silently downgrade every v720/v1080 download to 360p. They are only a
+# fallback for when the default client is bot-checked (LOGIN_REQUIRED).
+YOUTUBE_DOWNLOAD_CLIENTS = [None, "android", "ios"]
 
 def ydl_opts(url: str, client=None):
     opts = {"quiet": True, "noplaylist": True, "socket_timeout": 30}
@@ -198,8 +207,6 @@ def download():
                    "a_mp3_128", "a_mp3_320", "a_m4a_128", "a_m4a_320"):
         return jsonify({"ok": False, "error": "Unknown format.", "errorCode": "UNSUPPORTED"}), 400
     # 100% free like Snaptube — no premium gate on any format.
-    tmp = tempfile.mkdtemp()
-    out = os.path.join(tmp, "out.%(ext)s")
     if fmt.startswith("a_"):
         # a_mp3_128 / a_mp3_320 / a_m4a_128 / a_m4a_320
         _, codec, br = fmt.split("_")
@@ -220,25 +227,43 @@ def download():
                    f"/bestvideo+bestaudio/best")
         ext, mime = "mp4", "video/mp4"
         post = [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}]
-    opts = ydl_opts(url)
-    opts.update({"format": ydl_fmt, "outtmpl": out, "postprocessors": post,
-                 "merge_output_format": "mp4", "quiet": True, "noplaylist": True})
-    try:
-        with YoutubeDL(opts) as ydl:
-            ydl.download([url])
-    except DownloadError as e:
-        code, msg = classify_error(e)
-        return jsonify({"ok": False, "error": msg, "errorCode": code}), 422
-    # Find the finished file (yt-dlp + ffmpeg merge writes it to tmp/)
-    files = [os.path.join(tmp, f) for f in os.listdir(tmp)]
-    if not files:
-        return jsonify({"ok": False, "error": "Download produced no file.", "errorCode": "UNKNOWN"}), 500
-    path = max(files, key=os.path.getsize)
-    # Sanity: must be a real media file, not an error page
-    if os.path.getsize(path) < 1024:
-        return jsonify({"ok": False, "error": "Download failed.", "errorCode": "UNKNOWN"}), 500
-    return send_file(path, mimetype=mime, as_attachment=True,
-                     download_name=f"easysave.{ext}")
+    # /extract already retries YouTube player clients (ios->android->default)
+    # but /download used the default client only: on 2026-11-15 a fresh
+    # YouTube upload extracted fine yet its download failed LOGIN_REQUIRED
+    # in <2s on the default client (Railway IP bot-checked). Retry the
+    # download across clients, default first (best formats), then android,
+    # then ios; a bot-checked attempt fails fast at extraction, before any
+    # bytes are downloaded. Non-YouTube platforms ignore player_client,
+    # so they still get a single attempt.
+    clients = YOUTUBE_DOWNLOAD_CLIENTS if platform_of(url) == "youtube" else [None]
+    last_err = None
+    for client in clients:
+        tmp = tempfile.mkdtemp()
+        out = os.path.join(tmp, "out.%(ext)s")
+        opts = ydl_opts(url, client)
+        opts.update({"format": ydl_fmt, "outtmpl": out, "postprocessors": post,
+                     "merge_output_format": "mp4", "quiet": True, "noplaylist": True})
+        try:
+            with YoutubeDL(opts) as ydl:
+                ydl.download([url])
+        except DownloadError as e:
+            last_err = e
+            shutil.rmtree(tmp, ignore_errors=True)
+            continue
+        # Find the finished file (yt-dlp + ffmpeg merge writes it to tmp/)
+        files = [os.path.join(tmp, f) for f in os.listdir(tmp)]
+        if not files:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return jsonify({"ok": False, "error": "Download produced no file.", "errorCode": "UNKNOWN"}), 500
+        path = max(files, key=os.path.getsize)
+        # Sanity: must be a real media file, not an error page
+        if os.path.getsize(path) < 1024:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return jsonify({"ok": False, "error": "Download failed.", "errorCode": "UNKNOWN"}), 500
+        return send_file(path, mimetype=mime, as_attachment=True,
+                         download_name=f"easysave.{ext}")
+    code, msg = classify_error(last_err)
+    return jsonify({"ok": False, "error": msg, "errorCode": code}), 422
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)

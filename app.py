@@ -66,6 +66,9 @@ def classify_error(e: Exception) -> tuple[str, str]:
     if any(k in msg for k in ("private video", "this video is private", "login required",
                               "sign in to confirm", "age")):
         return "LOGIN_REQUIRED", "This video needs a login or is private / age-restricted."
+    if any(k in msg for k in ("this video is unavailable", "video unavailable",
+                              "video has been removed", "video is no longer")):
+        return "UNAVAILABLE", "This video is unavailable on YouTube (private, deleted, or removed). No downloader can download it."
     if any(k in msg for k in ("429", "too many requests", "bot", "confirm you're not a robot")):
         return "BOT_CHECK", "The platform is blocking this server right now. Try again later."
     if "unsupported url" in msg or "no video" in msg:

@@ -1,2 +1,4 @@
 flask
 yt-dlp
+curl-cffi
+bgutil-ytdlp-pot-provider

@@ -87,7 +87,16 @@ YOUTUBE_CLIENTS = ["ios", "android", None]  # retry with a different client each
 YOUTUBE_DOWNLOAD_CLIENTS = [None, "android", "ios"]
 
 def ydl_opts(url: str, client=None):
-    opts = {"quiet": True, "noplaylist": True, "socket_timeout": 30}
+    opts = {"quiet": True, "noplaylist": True, "socket_timeout": 30,
+            # YouTube throttles DASH fragments per connection (each fragment
+            # restarts at ~15KB/s and ramps); downloading fragments in
+            # parallel keeps the aggregate speed up. 2026-11-16: a fresh
+            # 23-min 720p60 upload stalled on Railway at <86KB/s sequential
+            # and died at the ~270s proxy wall on every format (v720/v360/
+            # audio), while an old video downloaded at 2MB/s — classic
+            # per-connection throttling of fresh uploads. Free, no service
+            # change; ignored for non-fragmented formats and extracts.
+            "concurrent_fragment_downloads": 16}
     if client:
         opts["extractor_args"] = {"youtube": {"player_client": [client]}}
     cf = cookies_file_for(url)

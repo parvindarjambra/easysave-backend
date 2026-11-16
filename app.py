@@ -1,6 +1,6 @@
 # EasySave media engine — Flask + yt-dlp + ffmpeg
 # Only use for videos you own or have permission to download.
-import base64, ipaddress, os, re, shutil, socket, subprocess, tempfile, urllib.parse
+import base64, ipaddress, json, os, re, shutil, socket, subprocess, tempfile, urllib.parse, urllib.request
 from flask import Flask, jsonify, request, send_file, Response
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
@@ -107,6 +107,161 @@ def extract_with_retries(url: str):
             last_err = e
     raise last_err
 
+# Free fallback for YouTube bot-checks (2026-11-15): a public Invidious
+# instance serves the same video's formats as direct googlevideo URLs,
+# signed for this server's IP because the server itself fetches the API.
+# Only used when yt-dlp fails on YouTube — passing videos and other
+# platforms never touch it. Piped and the public cobalt API were down /
+# blocked when last checked the same day; this instance answered with real
+# 720p/1080p formats and downloadable streams for the bot-checked video.
+INVIDIOUS_API = "https://yt.chocolatemoo53.com/api/v1/videos/"
+# Standard YouTube itag -> height. Invidious adaptive formats carry no
+# height field, only itag / container / codec.
+ITAG_HEIGHT = {160: 144, 278: 144, 394: 144, 133: 240, 242: 240, 395: 240,
+               134: 360, 243: 360, 396: 360, 135: 480, 244: 480, 397: 480,
+               136: 720, 247: 720, 298: 720, 302: 720, 398: 720,
+               137: 1080, 248: 1080, 299: 1080, 303: 1080, 399: 1080,
+               271: 1440, 308: 1440, 400: 1440, 313: 2160, 315: 2160, 401: 2160}
+
+def _invidious_video_id(url: str):
+    m = re.search(r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})", url)
+    return m.group(1) if m else None
+
+def invidious_info(url: str) -> dict:
+    """Fetch a YouTube video's formats from Invidious; returns a
+    yt-dlp-shaped info dict (only the fields build_formats needs)."""
+    vid = _invidious_video_id(url)
+    if not vid:
+        raise DownloadError("Not a YouTube video ID")
+    req = urllib.request.Request(INVIDIOUS_API + vid, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        d = json.load(r)
+    if d.get("error"):
+        raise DownloadError(str(d["error"]))
+    formats = []
+    for f in d.get("adaptiveFormats") or []:
+        typ = f.get("type") or ""
+        try:
+            itag = int(f.get("itag") or 0)
+        except (TypeError, ValueError):
+            continue
+        codecs = re.search(r'codecs="([^"]+)"', typ)
+        codec = codecs.group(1) if codecs else None
+        size = int(f.get("clen") or 0) or None
+        if typ.startswith("video/"):
+            h = ITAG_HEIGHT.get(itag)
+            if not h:
+                continue
+            formats.append({"format_id": str(itag), "height": h,
+                            "vcodec": codec or "avc1", "acodec": "none",
+                            "ext": f.get("container") or "mp4",
+                            "url": f.get("url"), "filesize": size})
+        elif typ.startswith("audio/"):
+            formats.append({"format_id": str(itag), "height": None,
+                            "vcodec": "none", "acodec": codec or "mp4a",
+                            "ext": f.get("container") or "m4a",
+                            "abr": int(int(f.get("bitrate") or 0) / 1000),
+                            "url": f.get("url"), "filesize": size})
+    if not formats:
+        raise DownloadError("Invidious returned no formats")
+    thumbs = d.get("videoThumbnails") or []
+    return {"title": d.get("title") or "Video", "uploader": d.get("author"),
+            "duration": d.get("lengthSeconds"),
+            "thumbnail": (thumbs[0].get("url") if thumbs else None),
+            "formats": formats}
+
+def _fetch_url(url: str, path: str, expected: int | None = None):
+    """Download a URL to path, verifying the size and resuming on drops.
+    googlevideo bodies can end early without an error (chunked transfer),
+    so a short file must be retried with Range, never silently kept —
+    a truncated audio track would otherwise make ffmpeg -shortest cut the
+    whole merged video down to a few seconds. ratebypass=yes is the same
+    throttle-bypass flag yt-dlp appends to googlevideo URLs."""
+    if "googlevideo.com/" in url and "ratebypass=" not in url:
+        url += "&ratebypass=yes"
+    for attempt in range(4):
+        have = os.path.getsize(path) if os.path.exists(path) else 0
+        if expected and have >= expected:
+            return
+        headers = {"User-Agent": "Mozilla/5.0"}
+        if have:
+            headers["Range"] = "bytes=%d-" % have
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                if have and r.status != 206:
+                    have = 0  # server ignored Range — restart from scratch
+                with open(path, "ab" if have else "wb") as f:
+                    shutil.copyfileobj(r, f, length=1024 * 256)
+        except Exception:
+            if attempt == 3:
+                raise
+            continue
+        got = os.path.getsize(path)
+        if expected:
+            if got >= expected:
+                return
+        else:
+            return  # no size to check against — one clean pass is enough
+    raise DownloadError("Fallback download incomplete")
+
+def invidious_download(url: str, fmt: str, tmp: str) -> str:
+    """Download a YouTube video via Invidious formats. Returns the path of
+    the finished file (MP4 with video+audio, or converted audio)."""
+    info = invidious_info(url)
+    formats = info["formats"]
+    if fmt.startswith("a_"):
+        _, codec, br = fmt.split("_")
+        aud = [f for f in formats if f["vcodec"] == "none"]
+        # Prefer m4a audio: it stream-copies into the MP4 merge (no
+        # re-encode); opus/webm forces a slow re-encode of the video too.
+        aud.sort(key=lambda f: ((f.get("ext") == "m4a"), f.get("abr") or 0), reverse=True)
+        if not aud:
+            raise DownloadError("No audio format from fallback")
+        src = os.path.join(tmp, "audio." + (aud[0]["ext"] or "m4a"))
+        _fetch_url(aud[0]["url"], src, aud[0].get("filesize"))
+        out = os.path.join(tmp, "out." + codec)
+        cmd = ["ffmpeg", "-y", "-i", src, "-vn"]
+        if codec == "mp3":
+            cmd += ["-c:a", "libmp3lame", "-b:a", br + "k"]
+        else:
+            cmd += ["-c:a", "aac", "-b:a", br + "k"]
+        cmd += [out]
+        r = subprocess.run(cmd, capture_output=True, timeout=300)
+        if r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 1024:
+            raise DownloadError("Fallback audio convert failed")
+        return out
+    h = int(fmt[1:])
+    nxt = {360: 480, 720: 1080, 1080: 2160, 2160: 4320}[h]
+    vids = [f for f in formats if f["vcodec"] != "none"]
+    aud = [f for f in formats if f["vcodec"] == "none"]
+    # Prefer m4a audio: it stream-copies into the MP4 merge (no re-encode).
+    aud.sort(key=lambda f: ((f.get("ext") == "m4a"), f.get("abr") or 0), reverse=True)
+    def pick(cands):
+        mp4 = [f for f in cands if (f.get("ext") or "") == "mp4"]
+        pool = mp4 or cands
+        return max(pool, key=lambda f: f["height"]) if pool else None
+    video = (pick([f for f in vids if f["height"] <= h])
+             or pick([f for f in vids if f["height"] <= nxt]) or pick(vids))
+    if not video or not aud:
+        raise DownloadError("No video/audio format from fallback")
+    vpath = os.path.join(tmp, "video." + (video["ext"] or "mp4"))
+    apath = os.path.join(tmp, "audio." + (aud[0]["ext"] or "m4a"))
+    _fetch_url(video["url"], vpath, video.get("filesize"))
+    _fetch_url(aud[0]["url"], apath, aud[0].get("filesize"))
+    out = os.path.join(tmp, "out.mp4")
+    # Stream-copy when both are MP4-family; re-encode otherwise (webm/vp9
+    # into mp4) so the result always plays with sound in the Gallery.
+    if video.get("ext") == "mp4" and aud[0].get("ext") in ("m4a", "mp4"):
+        cmd = ["ffmpeg", "-y", "-i", vpath, "-i", apath, "-c", "copy", "-shortest", out]
+    else:
+        cmd = ["ffmpeg", "-y", "-i", vpath, "-i", apath, "-c:v", "libx264",
+               "-preset", "veryfast", "-c:a", "aac", "-shortest", out]
+    r = subprocess.run(cmd, capture_output=True, timeout=600)
+    if r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 1024:
+        raise DownloadError("Fallback merge failed")
+    return out
+
 def build_formats(info: dict) -> list:
     """Map yt-dlp formats to the free/premium cards the UI shows."""
     out, seen = [], set()
@@ -185,8 +340,17 @@ def extract():
     try:
         info = extract_with_retries(url)
     except DownloadError as e:
-        code, msg = classify_error(e)
-        return jsonify({"ok": False, "error": msg, "errorCode": code}), 422
+        # YouTube bot-check fallback: Invidious serves the same video's
+        # formats when yt-dlp is blocked (fresh uploads from datacenter IPs).
+        if platform_of(url) == "youtube":
+            try:
+                info = invidious_info(url)
+            except Exception:
+                code, msg = classify_error(e)
+                return jsonify({"ok": False, "error": msg, "errorCode": code}), 422
+        else:
+            code, msg = classify_error(e)
+            return jsonify({"ok": False, "error": msg, "errorCode": code}), 422
     except Exception as e:
         code, msg = classify_error(e)
         return jsonify({"ok": False, "error": msg, "errorCode": code}), 500
@@ -262,6 +426,18 @@ def download():
             return jsonify({"ok": False, "error": "Download failed.", "errorCode": "UNKNOWN"}), 500
         return send_file(path, mimetype=mime, as_attachment=True,
                          download_name=f"easysave.{ext}")
+    # YouTube bot-check fallback: all yt-dlp clients failed — fetch the
+    # video/audio streams from Invidious and merge with ffmpeg instead.
+    if platform_of(url) == "youtube":
+        tmp = tempfile.mkdtemp()
+        try:
+            path = invidious_download(url, fmt, tmp)
+        except Exception as e:
+            last_err = e
+            shutil.rmtree(tmp, ignore_errors=True)
+        else:
+            return send_file(path, mimetype=mime, as_attachment=True,
+                             download_name=f"easysave.{ext}")
     code, msg = classify_error(last_err)
     return jsonify({"ok": False, "error": msg, "errorCode": code}), 422
 

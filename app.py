@@ -94,9 +94,12 @@ def ydl_opts(url: str, client=None):
             # 23-min 720p60 upload stalled on Railway at <86KB/s sequential
             # and died at the ~270s proxy wall on every format (v720/v360/
             # audio), while an old video downloaded at 2MB/s — classic
-            # per-connection throttling of fresh uploads. Free, no service
-            # change; ignored for non-fragmented formats and extracts.
-            "concurrent_fragment_downloads": 16}
+            # per-connection throttling of fresh uploads. 16 fragments fixed
+            # it for hours (296 MB in 63.7s) but by 14:40 PST the throttle
+            # tightened again and every format died at the wall; raising to
+            # 32 parallel fragments to restore aggregate speed. Free, no
+            # service change; ignored for non-fragmented formats and extracts.
+            "concurrent_fragment_downloads": 32}
     if client:
         opts["extractor_args"] = {"youtube": {"player_client": [client]}}
     cf = cookies_file_for(url)

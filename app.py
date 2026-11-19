@@ -1,6 +1,7 @@
 # EasySave media engine — Flask + yt-dlp + ffmpeg
 # Only use for videos you own or have permission to download.
 import base64, ipaddress, json, os, re, shutil, socket, subprocess, tempfile, urllib.parse, urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, jsonify, request, send_file, Response
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
@@ -127,6 +128,14 @@ def extract_with_retries(url: str):
 # blocked when last checked the same day; this instance answered with real
 # 720p/1080p formats and downloadable streams for the bot-checked video.
 INVIDIOUS_API = "https://yt.chocolatemoo53.com/api/v1/videos/"
+INVIDIOUS_HOST = "https://yt.chocolatemoo53.com"
+# Invidious direct googlevideo URLs are signed for the instance's own IP,
+# so fetching them from any other host gets HTTP 403 (verified 2026-11-18:
+# fresh 18-min upload — API returns formats fine, every stream URL 403s).
+# The instance proxies the same stream through itself at
+# /latest_version?local=true — that URL works from any host (verified 206
+# + valid MP4 bytes). The download fallback must use the proxied URL,
+# never the raw googlevideo one.
 # Standard YouTube itag -> height. Invidious adaptive formats carry no
 # height field, only itag / container / codec.
 ITAG_HEIGHT = {160: 144, 278: 144, 394: 144, 133: 240, 242: 240, 395: 240,
@@ -138,6 +147,14 @@ ITAG_HEIGHT = {160: 144, 278: 144, 394: 144, 133: 240, 242: 240, 395: 240,
 def _invidious_video_id(url: str):
     m = re.search(r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{11})", url)
     return m.group(1) if m else None
+
+
+def _invidious_proxy_url(vid: str, itag) -> str:
+    """Proxied stream URL for an Invidious format (see note on
+    INVIDIOUS_HOST): the instance fetches googlevideo itself, so the
+    caller's IP never matters."""
+    return (INVIDIOUS_HOST + "/latest_version?id=" + vid
+            + "&itag=" + str(itag) + "&local=true")
 
 def invidious_info(url: str) -> dict:
     """Fetch a YouTube video's formats from Invidious; returns a
@@ -182,15 +199,12 @@ def invidious_info(url: str) -> dict:
             "thumbnail": (thumbs[0].get("url") if thumbs else None),
             "formats": formats}
 
-def _fetch_url(url: str, path: str, expected: int | None = None):
-    """Download a URL to path, verifying the size and resuming on drops.
-    googlevideo bodies can end early without an error (chunked transfer),
-    so a short file must be retried with Range, never silently kept —
-    a truncated audio track would otherwise make ffmpeg -shortest cut the
-    whole merged video down to a few seconds. ratebypass=yes is the same
-    throttle-bypass flag yt-dlp appends to googlevideo URLs."""
-    if "googlevideo.com/" in url and "ratebypass=" not in url:
-        url += "&ratebypass=yes"
+def _fetch_url_single(url: str, path: str, expected: int | None = None):
+    """Single-stream download to path, verifying the size and resuming on
+    drops. googlevideo bodies can end early without an error (chunked
+    transfer), so a short file must be retried with Range, never silently
+    kept — a truncated audio track would otherwise make ffmpeg -shortest
+    cut the whole merged video down to a few seconds."""
     for attempt in range(4):
         have = os.path.getsize(path) if os.path.exists(path) else 0
         if expected and have >= expected:
@@ -217,11 +231,86 @@ def _fetch_url(url: str, path: str, expected: int | None = None):
             return  # no size to check against — one clean pass is enough
     raise DownloadError("Fallback download incomplete")
 
+def _fetch_url_parallel(url: str, path: str, expected: int):
+    """Download in 8 parallel Range chunks, then concatenate. YouTube
+    throttles each googlevideo connection (a fresh upload crawls at
+    <1MB/s on one stream and dies at the ~270s proxy wall), but parallel
+    connections scale ~8x — measured 661KB/s single vs 5.1MB/s with 8
+    workers on the same 720p60 stream, so a ~400MB fresh upload finishes
+    in ~80s instead of never. Parts are verified by size before the
+    concat; any failure raises and the caller falls back to single-stream.
+    """
+    workers = 8
+    chunk = (expected + workers - 1) // workers
+    parts = ["%s.part%d" % (path, i) for i in range(workers)]
+
+    def fetch_one(i: int):
+        start = i * chunk
+        end = min(start + chunk, expected) - 1
+        if start > end:
+            open(parts[i], "wb").close()  # empty tail chunk
+            return
+        want = end - start + 1
+        for attempt in range(3):
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "Mozilla/5.0",
+                              "Range": "bytes=%d-%d" % (start, end)})
+            try:
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    if r.status != 206:
+                        raise DownloadError("Range ignored")
+                    with open(parts[i], "wb") as f:
+                        shutil.copyfileobj(r, f, length=1024 * 256)
+            except Exception:
+                if attempt == 2:
+                    raise
+                continue
+            if os.path.getsize(parts[i]) == want:
+                return
+            if attempt == 2:
+                raise DownloadError("Chunk incomplete")
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(fetch_one, range(workers)))
+        # Concatenate, deleting each part as it is consumed, so peak disk
+        # stays near one copy of the file instead of two (parts + output).
+        with open(path, "wb") as out:
+            for p in parts:
+                with open(p, "rb") as f:
+                    shutil.copyfileobj(f, out, length=1024 * 256)
+                os.remove(p)
+        if os.path.getsize(path) != expected:
+            raise DownloadError("Parallel download incomplete")
+    finally:
+        for p in parts:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+def _fetch_url(url: str, path: str, expected: int | None = None):
+    """Download a URL to path, verifying the size and resuming on drops.
+    ratebypass=yes is the same throttle-bypass flag yt-dlp appends to
+    googlevideo URLs. Large files go in 8 parallel Range chunks (see
+    _fetch_url_parallel); anything else — or a parallel failure — uses
+    the single-stream path, so a server that ignores Range still works."""
+    if "googlevideo.com/" in url and "ratebypass=" not in url:
+        url += "&ratebypass=yes"
+    if expected and expected >= 8 * 1024 * 1024:
+        try:
+            _fetch_url_parallel(url, path, expected)
+            return
+        except Exception:
+            if os.path.exists(path):
+                os.remove(path)  # never keep a partial concat
+    _fetch_url_single(url, path, expected)
+
 def invidious_download(url: str, fmt: str, tmp: str) -> str:
     """Download a YouTube video via Invidious formats. Returns the path of
     the finished file (MP4 with video+audio, or converted audio)."""
     info = invidious_info(url)
     formats = info["formats"]
+    vid = _invidious_video_id(url)
     if fmt.startswith("a_"):
         _, codec, br = fmt.split("_")
         aud = [f for f in formats if f["vcodec"] == "none"]
@@ -231,7 +320,8 @@ def invidious_download(url: str, fmt: str, tmp: str) -> str:
         if not aud:
             raise DownloadError("No audio format from fallback")
         src = os.path.join(tmp, "audio." + (aud[0]["ext"] or "m4a"))
-        _fetch_url(aud[0]["url"], src, aud[0].get("filesize"))
+        _fetch_url(_invidious_proxy_url(vid, aud[0]["format_id"]), src,
+                   aud[0].get("filesize"))
         out = os.path.join(tmp, "out." + codec)
         cmd = ["ffmpeg", "-y", "-i", src, "-vn"]
         if codec == "mp3":
@@ -259,16 +349,22 @@ def invidious_download(url: str, fmt: str, tmp: str) -> str:
         raise DownloadError("No video/audio format from fallback")
     vpath = os.path.join(tmp, "video." + (video["ext"] or "mp4"))
     apath = os.path.join(tmp, "audio." + (aud[0]["ext"] or "m4a"))
-    _fetch_url(video["url"], vpath, video.get("filesize"))
-    _fetch_url(aud[0]["url"], apath, aud[0].get("filesize"))
+    _fetch_url(_invidious_proxy_url(vid, video["format_id"]), vpath,
+               video.get("filesize"))
+    _fetch_url(_invidious_proxy_url(vid, aud[0]["format_id"]), apath,
+               aud[0].get("filesize"))
     out = os.path.join(tmp, "out.mp4")
     # Stream-copy when both are MP4-family; re-encode otherwise (webm/vp9
     # into mp4) so the result always plays with sound in the Gallery.
+    # NOTE: no -shortest here — the proxied DASH video stream's timestamps
+    # make ffmpeg stop at 279s of a 1084s video with it (verified
+    # 2026-11-18); without it the merge is the full length. Both streams
+    # are the same video, so nothing needs trimming.
     if video.get("ext") == "mp4" and aud[0].get("ext") in ("m4a", "mp4"):
-        cmd = ["ffmpeg", "-y", "-i", vpath, "-i", apath, "-c", "copy", "-shortest", out]
+        cmd = ["ffmpeg", "-y", "-i", vpath, "-i", apath, "-c", "copy", out]
     else:
         cmd = ["ffmpeg", "-y", "-i", vpath, "-i", apath, "-c:v", "libx264",
-               "-preset", "veryfast", "-c:a", "aac", "-shortest", out]
+               "-preset", "veryfast", "-c:a", "aac", out]
     r = subprocess.run(cmd, capture_output=True, timeout=600)
     if r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 1024:
         raise DownloadError("Fallback merge failed")
